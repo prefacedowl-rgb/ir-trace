@@ -142,9 +142,15 @@ interface AppState {
   toggleRawOut: (mode: 'ON' | 'OFF') => Promise<void>;
   submitAll: () => Promise<void>;
 
+  showScanModal: boolean;
+  scanResults: Array<{ id: string; name: string | null; rssi: number | null }>;
+
   connect: () => Promise<void>;
   disconnect: () => void;
   toggleConnect: () => Promise<void>;
+  openScanModal: () => Promise<void>;
+  closeScanModal: () => void;
+  connectToScannedDevice: (deviceId: string) => Promise<void>;
 
   // Internal Logic
   onNotify: (raw: string) => void;
@@ -367,6 +373,10 @@ export const useStore = create<AppState>((set, get) => {
     protoCheckState: 'empty',
     protoCheckIcon: '○',
     protoCheckLabel: 'IR protocol — not tested yet',
+
+    // Scan Modal State
+    showScanModal: false,
+    scanResults: [],
 
     // Shake triggers
     wifiShakeTrigger: 0,
@@ -950,7 +960,138 @@ export const useStore = create<AppState>((set, get) => {
       if (get().connected) {
         get().disconnect();
       } else {
-        await get().connect();
+        await get().openScanModal();
+      }
+    },
+
+    openScanModal: async () => {
+      if (isBleMock) {
+        set({ showScanModal: true, scanResults: [], isScanning: true });
+        setTimeout(() => set(s => ({ scanResults: [...s.scanResults, { id: 'mock-1', name: 'IrTrace-BLE', rssi: -42 }] })), 600);
+        setTimeout(() => set(s => ({ scanResults: [...s.scanResults, { id: 'mock-2', name: 'IrTrace-Kitchen', rssi: -67 }] })), 1100);
+        setTimeout(() => set(s => ({ scanResults: [...s.scanResults, { id: 'mock-3', name: 'IrTrace-Office', rssi: -81 }] })), 1800);
+        return;
+      }
+
+      try {
+        const hasPermissions = await requestBluetoothPermissions();
+        if (!hasPermissions) {
+          set({ statusStripState: 'err', statusStripMsg: 'Bluetooth/Location permission denied' });
+          get().addLog('err', 'Bluetooth/Location permission denied');
+          return;
+        }
+        set({ showScanModal: true, scanResults: [], isScanning: true });
+        bleManager.startDeviceScan([SERVICE_UUID], null, (error, device) => {
+          if (error) {
+            set({ isScanning: false });
+            return;
+          }
+          if (device) {
+            set(s => {
+              if (s.scanResults.find(d => d.id === device.id)) return s;
+              return { scanResults: [...s.scanResults, { id: device.id, name: device.name, rssi: device.rssi }] };
+            });
+          }
+        });
+      } catch (err: any) {
+        set({ statusStripState: 'err', statusStripMsg: `Failed: ${err.message}` });
+        get().addLog('err', err.message);
+      }
+    },
+
+    closeScanModal: () => {
+      if (!isBleMock) bleManager.stopDeviceScan();
+      set({ showScanModal: false, scanResults: [], isScanning: false });
+    },
+
+    connectToScannedDevice: async (deviceId: string) => {
+      if (!isBleMock) bleManager.stopDeviceScan();
+      set({ isScanning: false, showScanModal: false, statusStripState: 'warn', statusStripMsg: 'Connecting...' });
+
+      if (isBleMock) {
+        const mockName = get().scanResults.find(d => d.id === deviceId)?.name ?? 'IrTrace-BLE-MOCK';
+        setTimeout(() => {
+          set({
+            connected: true,
+            bleDevice: { id: deviceId, name: mockName },
+            rxChar: { writeWithResponse: async () => {} },
+            statusStripState: 'ok',
+            statusStripMsg: `Connected to ${mockName}`,
+            isDiscoveryCardVisible: true,
+            scanResults: [],
+          });
+          get().addLog('sys', `Connected to ${mockName}`);
+          resetConfirmedProtocol();
+          resetWifiUi('Waiting for device scan...');
+          resetAdminUi();
+          setFindRxState(false);
+          get().updateSaveChecklist();
+          setTimeout(() => {
+            get().onNotify('FW:v@0.0.3');
+            get().onNotify('VAR:5');
+            get().onNotify('PWR:ON');
+            get().onNotify('TEMP:24');
+            get().onNotify('RPT:1');
+            get().onNotify('RAW:OFF');
+            get().onNotify('NET:0:MyHomeWifi:-45:Secured');
+            get().onNotify('NET:1:OfficeGuest:-62:Secured');
+            get().onNotify('NET:DONE');
+            get().onNotify('LRN:STATUS');
+          }, 300);
+        }, 800);
+        return;
+      }
+
+      try {
+        const connectedDevice = await bleManager.connectToDevice(deviceId);
+        await connectedDevice.discoverAllServicesAndCharacteristics();
+
+        bleManager.onDeviceDisconnected(deviceId, () => { get().disconnect(); });
+
+        const services = await connectedDevice.services();
+        let txChar: any = null;
+        let rxChar: any = null;
+
+        for (const service of services) {
+          if (service.uuid === SERVICE_UUID) {
+            const characteristics = await service.characteristics();
+            for (const char of characteristics) {
+              if (char.uuid === TX_UUID) txChar = char;
+              if (char.uuid === RX_UUID) rxChar = char;
+            }
+          }
+        }
+
+        if (!txChar || !rxChar) throw new Error('Required BLE characteristics not found');
+
+        connectedDevice.monitorCharacteristicForService(SERVICE_UUID, TX_UUID, (monitorError, char) => {
+          if (monitorError) { get().addLog('err', `Notification error: ${monitorError.message}`); return; }
+          if (char?.value) get().onNotify(base64Decode(char.value));
+        });
+
+        set({
+          connected: true,
+          bleDevice: connectedDevice,
+          rxChar,
+          statusStripState: 'ok',
+          statusStripMsg: `Connected to ${connectedDevice.name || 'IrTrace-BLE'}`,
+          isDiscoveryCardVisible: true,
+          scanResults: [],
+        });
+
+        get().addLog('sys', `Connected to ${connectedDevice.name || 'IrTrace-BLE'}`);
+        resetConfirmedProtocol();
+        resetWifiUi('Waiting for device scan...');
+        resetAdminUi();
+        setFindRxState(false);
+        get().updateSaveChecklist();
+
+        await get().sendCmd('wget');
+        await get().sendCmd('status');
+        await get().sendCmd('LRN:STATUS');
+      } catch (connErr: any) {
+        set({ statusStripState: 'err', statusStripMsg: `Failed: ${connErr.message}` });
+        get().addLog('err', connErr.message);
       }
     },
 

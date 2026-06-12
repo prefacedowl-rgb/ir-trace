@@ -28,6 +28,7 @@ import { NeonInput } from './src/components/NeonInput';
 import { CustomDropdown } from './src/components/CustomDropdown';
 import { CheckItem } from './src/components/CheckItem';
 import { Pill } from './src/components/Pill';
+import { BluetoothScanModal } from './src/components/BluetoothScanModal';
 import { ALL_VARIANTS, LEARN_SLOT_NAMES, WEB_VERSION } from './src/utils/constants';
 import Animated, {
   useSharedValue,
@@ -277,6 +278,7 @@ export default function App() {
 
   return (
     <View style={styles.container}>
+      <BluetoothScanModal />
       <StatusBar barStyle="dark-content" backgroundColor="#EEF2EB" />
       {/* Nature photo layer */}
       <Image
